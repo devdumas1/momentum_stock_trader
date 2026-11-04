@@ -1,0 +1,11 @@
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.50
+tqdm>=4.66
+lxml>=5.0
+requests>=2.31
+# Live trading. alpaca-trade-api 3.2.0 pins websockets<11 / urllib3<2, which
+# conflict with yfinance. Its REST client works fine with newer versions, so
+# install it separately without its pins:
+#   pip install --no-deps alpaca-trade-api==3.2.0
+#   pip install websocket-client msgpack aiohttp PyYAML deprecation
