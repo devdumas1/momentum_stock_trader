@@ -1,65 +1,146 @@
-"""Momentum scoring and stock selection.
+"""Runs any registered trend signal (see signals.py) and picks the portfolio.
 
-Score = annualized return / annualized volatility, measured over a lookback
-window that skips the most recent month (the classic "12-1" momentum, which
-avoids the short-term reversal effect). It is a risk-adjusted momentum: a
-stock that rose 40% smoothly ranks above one that rose 40% on wild swings.
+The engine is signal-agnostic: each rebalance it hands the chosen signal a clean
+price window, ranks stocks by the returned score, optionally drops stocks that
+aren't in an uptrend (score <= 0, the rest stays in cash), and holds the top N
+equal-weighted.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+import importlib.util
+import inspect
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-TRADING_DAYS_PER_YEAR = 252
-TRADING_DAYS_PER_MONTH = 21
+from signals import SIGNALS, TRADING_DAYS_PER_YEAR, Signal  # noqa: F401  (re-exported)
 
 
 @dataclass
-class MomentumConfig:
-    lookback_months: int = 12      # total window used to measure momentum
-    skip_months: int = 1           # most recent months excluded from the window
-    top_n: int = 10                # number of stocks held
-    max_missing_frac: float = 0.05  # drop stocks missing more data than this in the window
-    require_positive: bool = False  # if True, only hold stocks with positive return (rest in cash)
+class StrategyConfig:
+    signal: str = "momentum"
+    params: dict = field(default_factory=dict)  # overrides for the signal's defaults
+    top_n: int = 10
+    trend_filter: bool | None = None  # None -> the signal's own default
+    max_missing_frac: float = 0.05    # drop stocks missing more data than this in the window
+
+    def __post_init__(self) -> None:
+        if self.signal not in SIGNALS:
+            raise ValueError(f"Unknown signal {self.signal!r}. Available: {', '.join(SIGNALS)}")
+        defaults = signal_defaults(self.sig)
+        unknown = set(self.params) - set(defaults)
+        if unknown:
+            raise ValueError(f"Signal {self.signal!r} has no parameter(s) {sorted(unknown)}; "
+                             f"it takes {sorted(defaults)}")
+        self.params = {**defaults, **self.params}
 
     @property
-    def lookback_days(self) -> int:
-        return self.lookback_months * TRADING_DAYS_PER_MONTH
+    def sig(self) -> Signal:
+        return SIGNALS[self.signal]
 
     @property
-    def skip_days(self) -> int:
-        return self.skip_months * TRADING_DAYS_PER_MONTH
+    def history_days(self) -> int:
+        return int(self.sig.history(self.params))
+
+    @property
+    def use_trend_filter(self) -> bool:
+        return self.sig.trend_filter if self.trend_filter is None else self.trend_filter
+
+    def describe(self) -> str:
+        params = " ".join(f"{k}={v}" for k, v in self.params.items())
+        return (f"signal={self.signal} ({params})  top_n={self.top_n}  "
+                f"trend_filter={'on' if self.use_trend_filter else 'off'}")
 
 
-def momentum_scores(prices: pd.DataFrame, as_of: pd.Timestamp, cfg: MomentumConfig) -> pd.DataFrame:
-    """Return a DataFrame (return, volatility, score) for every eligible stock,
-    using only prices up to and including `as_of`, sorted best first."""
+def signal_defaults(sig: Signal) -> dict:
+    params = list(inspect.signature(sig.fn).parameters.values())[1:]  # skip `window`
+    return {p.name: p.default for p in params}
+
+
+def score_stocks(prices: pd.DataFrame, as_of: pd.Timestamp, cfg: StrategyConfig) -> pd.DataFrame:
+    """Signal output for every eligible stock using prices up to `as_of`, best first."""
     hist = prices.loc[:as_of]
-    if len(hist) < cfg.lookback_days + 1:
-        return pd.DataFrame(columns=["return", "volatility", "score"])
+    need = cfg.history_days
+    if len(hist) < need + 1:
+        return pd.DataFrame(columns=["score"])
 
-    window = hist.iloc[-(cfg.lookback_days + 1) : len(hist) - cfg.skip_days]
-    # Eligibility: priced on both ends and mostly complete over the window.
+    window = hist.iloc[-(need + 1) :]
+    # Eligible: priced at both ends of the window and mostly complete in between.
     complete = window.notna().mean() >= 1 - cfg.max_missing_frac
     eligible = complete & window.iloc[0].notna() & window.iloc[-1].notna()
     window = window.loc[:, eligible].ffill()
+    if window.shape[1] == 0:
+        return pd.DataFrame(columns=["score"])
 
-    n_days = len(window) - 1
-    total_ret = window.iloc[-1] / window.iloc[0] - 1
-    ann_ret = (1 + total_ret) ** (TRADING_DAYS_PER_YEAR / n_days) - 1
-    ann_vol = window.pct_change().iloc[1:].std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-
-    out = pd.DataFrame({"return": total_ret, "volatility": ann_vol})
-    out["score"] = ann_ret / ann_vol.replace(0, np.nan)
-    return out.dropna().sort_values("score", ascending=False)
+    out = cfg.sig.fn(window, **cfg.params).replace([np.inf, -np.inf], np.nan)
+    return out.dropna(subset=["score"]).sort_values("score", ascending=False)
 
 
-def select_top(scores: pd.DataFrame, cfg: MomentumConfig) -> list[str]:
-    """Pick the top-N tickers by score."""
-    picks = scores
-    if cfg.require_positive:
-        picks = picks[picks["return"] > 0]
+def select_top(scores: pd.DataFrame, cfg: StrategyConfig) -> list[str]:
+    """Pick the top-N tickers by score (only uptrending ones if the trend filter is on)."""
+    picks = scores[scores["score"] > 0] if cfg.use_trend_filter else scores
     return picks.head(cfg.top_n).index.tolist()
+
+
+def history_start(date, cfg: StrategyConfig) -> str:
+    """Calendar date early enough to have `cfg.history_days` trading days before `date`."""
+    days = int(cfg.history_days * 365 / TRADING_DAYS_PER_YEAR) + 45
+    return (pd.Timestamp(date) - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def load_signal_file(path: str) -> None:
+    """Import a user file so its @signal-decorated functions get registered."""
+    spec = importlib.util.spec_from_file_location(Path(path).stem, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Cannot load signal file {path}")
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+# --- shared command-line options for backtest.py and live_trade.py ---------------
+
+def add_strategy_args(p: argparse.ArgumentParser) -> None:
+    g = p.add_argument_group("strategy")
+    g.add_argument("--signal", default="momentum", help="trend rule to run (see --list-signals)")
+    g.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                   help="signal parameter, repeatable (e.g. --param fast=20 --param slow=100)")
+    g.add_argument("--signal-file", action="append", default=[],
+                   help="python file defining extra @signal rules")
+    g.add_argument("--list-signals", action="store_true", help="list available signals and exit")
+    g.add_argument("--top-n", type=int, default=10)
+    g.add_argument("--trend-filter", action=argparse.BooleanOptionalAction, default=None,
+                   help="hold cash instead of stocks with score <= 0 (default: per signal)")
+
+
+def _parse_value(text: str):
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return text
+
+
+def config_from_args(args: argparse.Namespace) -> StrategyConfig:
+    for path in args.signal_file:
+        load_signal_file(path)
+    if args.list_signals:
+        for sig in SIGNALS.values():
+            params = " ".join(f"{k}={v}" for k, v in signal_defaults(sig).items())
+            filt = "trend filter on" if sig.trend_filter else "trend filter off"
+            print(f"{sig.name:12} {sig.description}\n{'':12} params: {params}  ({filt} by default)")
+        raise SystemExit(0)
+    params = {}
+    for item in args.param:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--param expects KEY=VALUE, got {item!r}")
+        params[key.strip()] = _parse_value(value.strip())
+    try:
+        return StrategyConfig(signal=args.signal, params=params, top_n=args.top_n,
+                              trend_filter=args.trend_filter)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
